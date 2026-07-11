@@ -3,3 +3,14 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Dashboard local runtime data (do not commit trial DB or session exports)
+dashboard/data/*.db
+dashboard/data/v2_shadow_results.csv
+dashboard/data/summary/trials.csv
+dashboard/scoring/v2/calibrated/

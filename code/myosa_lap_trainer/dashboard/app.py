@@ -1,5 +1,5 @@
 """
-MYOSA Laparoscopic Trainer — product-style Streamlit dashboard.
+Smooth Operator — Smart Laparoscopic Skill Trainer dashboard.
 Connects to firmware via pyserial; parses EVENT / LIVE / FINAL_SCORE lines.
 """
 
@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,38 @@ import plotly.graph_objects as go
 import serial
 import serial.tools.list_ports
 import streamlit as st
+
+from serial_manager import (
+    connect as sm_connect,
+    disconnect as sm_disconnect,
+    drain_lines as sm_drain_lines,
+    get_serial,
+    health_label as sm_health_label,
+    is_connected as sm_is_connected,
+    last_error as sm_last_error,
+    sync_session_connection_state,
+    write_command as sm_write_command,
+)
+from live_metrics import append_chart_live, clear_live_metrics, update_live_metrics
+from session_sync import (
+    append_diag,
+    clear_live_trial_state,
+    control_flags,
+    mark_final_recorded,
+    reset_clears_completed_result,
+    should_record_final_score,
+)
+from trial_context import clear_trial_context, context_for_save, snapshot_trial_context
+from storage import get_store
+from ui.components import render_app_header
+from ui.navigation import close_page_shell, render_page_tabs
+from ui.theme import inject_theme, render_sidebar_branding
+from ui.pages.live_trial import render_live_trial
+from ui.pages.trial_breakdown import render_trial_breakdown
+from ui.pages.track_progress import render_track_progress
+from ui.pages.tune_scoring import render_tune_scoring
+
+V2_SHADOW_ENABLED = True
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -29,8 +62,20 @@ SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
 BAUD = 115200
 RAW_LOG_MAX = 200
 LIVE_BUFFER_MAX = 40
-POLL_FRAGMENT_SEC = 0.4
+POLL_FRAGMENT_SEC = 0.1
+PLOT_REFRESH_SEC = 0.5
 DATA_QUIET_SEC = 5.0
+SYNC_READ_SEC = 0.75
+COACH_HYSTERESIS_SEC = 0.4
+
+
+def _serial_log(msg: str) -> None:
+    append_diag(st.session_state, msg)
+
+
+def sm_connection_status_port_busy() -> bool:
+    err = sm_last_error().lower()
+    return "access is denied" in err or "permission" in err or sm_health_label() == "Port Busy"
 
 COMPONENT_LABELS = [
     ("course", "Course", 35),
@@ -154,6 +199,20 @@ CUSTOM_CSS = """
 .conn-ok { color: #2ecc71; font-weight: 600; }
 .conn-warn { color: #f39c12; font-weight: 600; }
 .conn-off { color: #95a5a6; font-weight: 600; }
+.status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+.dot-idle { background: #95a5a6; }
+.dot-ready { background: #3498db; }
+.dot-running { background: #2ecc71; }
+.dot-complete { background: #f1c40f; }
+.dot-error { background: #e74c3c; }
+.demo-topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+.demo-title { font-size: 1.6rem; font-weight: 800; margin: 0; }
+.demo-sub { opacity: 0.75; margin: 0; font-size: 0.95rem; }
+.score-xl { font-size: 4rem; font-weight: 800; line-height: 1; margin: 0; }
+.time-xl { font-size: 2.2rem; font-weight: 700; margin: 0; }
+.feedback-line { font-size: 1.25rem; font-weight: 600; padding: 0.75rem; border-radius: 8px; background: rgba(52,152,219,0.1); margin-top: 0.5rem; }
+.metric-row { display: flex; justify-content: space-between; padding: 0.35rem 0; border-bottom: 1px solid rgba(128,128,128,0.15); }
+.hw-strip { font-size: 0.85rem; opacity: 0.85; margin-top: 1rem; }
 </style>
 """
 
@@ -321,6 +380,47 @@ def ingest_line(line: str) -> None:
         st.session_state.raw_lines = st.session_state.raw_lines[-RAW_LOG_MAX:]
 
     try:
+        if line.startswith("SESSION,"):
+            sess = parse_key_value_line(line)
+            sess["type"] = "SESSION"
+            _touch_data_received()
+            prev_session = str(st.session_state.get("session", "IDLE")).upper()
+            if "session" in sess:
+                st.session_state.session = str(sess["session"]).upper()
+            if "phase" in sess:
+                st.session_state.current_state = str(sess["phase"]).upper()
+            if "trial" in sess:
+                st.session_state.current_trial = safe_int(sess["trial"])
+            if "score" in sess:
+                st.session_state.live_score = safe_int(sess["score"])
+            if "elapsed_ms" in sess:
+                st.session_state.elapsed_ms = safe_int(sess["elapsed_ms"])
+            if "imu" in sess:
+                st.session_state.hw_imu = safe_int(sess["imu"])
+            if "apds" in sess:
+                st.session_state.hw_apds = safe_int(sess["apds"])
+            if "oled" in sess:
+                st.session_state.hw_oled = safe_int(sess["oled"])
+            action = str(sess.get("action", "")).lower()
+            new_session = str(st.session_state.session).upper()
+            append_diag(
+                st.session_state,
+                f"STATE {prev_session} -> {new_session} source=SESSION action={action or 'none'}",
+            )
+            if action == "reset":
+                clear_live_trial_state(
+                    st.session_state,
+                    preserve_final=not reset_clears_completed_result(prev_session),
+                )
+                append_diag(st.session_state, "live_state_cleared")
+            elif prev_session == "RUNNING" and new_session == "READY":
+                clear_live_trial_state(st.session_state, preserve_final=True)
+                append_diag(st.session_state, "running_cancel_cleared")
+            elif prev_session == "COMPLETE" and new_session == "READY":
+                clear_live_trial_state(st.session_state, preserve_final=False)
+                append_diag(st.session_state, "complete_reset_cleared")
+            return
+
         if line.startswith("EVENT,"):
             ev = parse_event_line(line)
             if ev:
@@ -339,6 +439,37 @@ def ingest_line(line: str) -> None:
                     st.session_state.current_feedback = str(ev["issue"])
                 if ev.get("event") == "DOCK_COMPLETE":
                     st.session_state.current_state = "COMPLETE"
+                event_name = str(ev.get("event", ""))
+                if event_name in ("RESET", "RETURN_TO_IDLE"):
+                    prev = str(st.session_state.get("session", "IDLE")).upper()
+                    st.session_state.session = "READY"
+                    clear_live_trial_state(
+                        st.session_state,
+                        preserve_final=not reset_clears_completed_result(prev),
+                    )
+                    clear_live_metrics(st.session_state)
+                    clear_trial_context(st.session_state)
+                    append_diag(st.session_state, f"reset_event {event_name}")
+                elif event_name == "TRIAL_START":
+                    st.session_state.session = "RUNNING"
+                    st.session_state.current_feedback = "Move through tube and poles smoothly."
+                    st.session_state.phase_timestamps = {"trial_start": datetime.now().isoformat()}
+                    st.session_state.live_v2_obj = None
+                    clear_live_metrics(st.session_state)
+                    tid = safe_int(ev.get("trial")) if ev.get("trial") is not None else None
+                    snapshot_trial_context(st.session_state, firmware_trial_id=tid)
+                    append_diag(st.session_state, "trial_start")
+                elif event_name in ("DOCK_COMPLETE", "STOP_COMPLETE"):
+                    st.session_state.session = "COMPLETE"
+                    append_diag(st.session_state, f"trial_complete {event_name}")
+                elif event_name == "HOVER_ENTER":
+                    pts = st.session_state.get("phase_timestamps") or {}
+                    pts["hover_enter"] = datetime.now().isoformat()
+                    st.session_state.phase_timestamps = pts
+                elif event_name == "HOVER_COMPLETE":
+                    pts = st.session_state.get("phase_timestamps") or {}
+                    pts["hover_complete"] = datetime.now().isoformat()
+                    st.session_state.phase_timestamps = pts
             return
 
         if line.startswith("LIVE,"):
@@ -351,28 +482,98 @@ def ingest_line(line: str) -> None:
                     st.session_state.live_rows = st.session_state.live_rows[-LIVE_BUFFER_MAX:]
                 if "state" in live:
                     st.session_state.current_state = str(live["state"]).upper()
+                if live.get("session"):
+                    st.session_state.session = str(live["session"]).upper()
+                if "elapsed_ms" in live:
+                    st.session_state.elapsed_ms = safe_int(live["elapsed_ms"])
                 if "score" in live:
                     st.session_state.live_score = int(live["score"])
                 if "issue" in live:
                     st.session_state.current_feedback = str(live["issue"])
+                update_live_metrics(st.session_state, live)
+                _update_live_v2_and_feedback(live)
+                append_chart_live(st.session_state, live_v2=st.session_state.get("live_v2"))
             return
 
         if line.startswith("FINAL_SCORE,"):
             fin = parse_final_score_line(line)
             if fin:
                 _touch_data_received()
-                st.session_state.latest_final = fin
-                st.session_state.current_state = "COMPLETE"
-                if "total" in fin:
-                    st.session_state.live_score = int(fin["total"])
-                if "feedback" in fin:
-                    st.session_state.current_feedback = str(fin["feedback"])
+                trial_raw = fin.get("trial")
+                trial_id = safe_int(trial_raw) if trial_raw is not None else None
+                st.session_state.debug_last_final_score = (
+                    f"trial={trial_id} total={fin.get('total')} hover_ms={fin.get('hover_ms')} "
+                    f"at={datetime.now().isoformat(timespec='seconds')}"
+                )
+                st.session_state.final_count = int(st.session_state.get("final_count", 0)) + 1
+
+                def _apply_final_ui() -> None:
+                    st.session_state.session = "COMPLETE"
+                    st.session_state.current_state = "COMPLETE"
+                    if "total" in fin:
+                        st.session_state.live_score = int(fin["total"])
+                    st.session_state.latest_final = fin
+                    if "feedback" in fin:
+                        st.session_state.current_feedback = str(fin["feedback"])
+                    if "trial" in fin:
+                        st.session_state.current_trial = int(fin["trial"])
+
+                if not should_record_final_score(st.session_state, trial_id):
+                    append_diag(
+                        st.session_state,
+                        f"FINAL_SCORE duplicate line trial={trial_id}",
+                    )
+                    _apply_final_ui()
+                    saved_db: set[int] = st.session_state.setdefault("db_saved_trials", set())
+                    if trial_id is not None and trial_id not in saved_db:
+                        _persist_completed_trial(fin, trial_id)
+                    return
+
+                _apply_final_ui()
                 if "trial" in fin:
                     st.session_state.current_trial = int(fin["trial"])
                 upsert_completed_trial(fin)
                 st.session_state.prev_score = int(fin.get("total", 0))
                 st.session_state.prev_feedback = str(fin.get("feedback", ""))
-                _save_trials_csv()
+                try:
+                    _save_trials_csv()
+                    append_diag(st.session_state, f"csv_write trial={trial_id}")
+                except Exception as csv_exc:  # noqa: BLE001
+                    append_diag(st.session_state, f"csv_write_failed {csv_exc}")
+                append_diag(st.session_state, f"final_score trial={trial_id} total={fin.get('total')}")
+                row_id = _persist_completed_trial(fin, trial_id)
+                if row_id is not None:
+                    mark_final_recorded(st.session_state, trial_id)
+                if V2_SHADOW_ENABLED:
+                    try:
+                        from scoring.v2.shadow import append_shadow_result
+
+                        logged: set[int] = st.session_state.setdefault("v2_shadow_logged", set())
+                        v2_result = append_shadow_result(
+                            fin,
+                            logged_trials=logged,
+                            enabled=True,
+                        )
+                        if v2_result is not None:
+                            st.session_state.latest_v2_preview = {
+                                "overall_score": v2_result.overall_score,
+                                "control_score": v2_result.control_score,
+                                "efficiency_score": v2_result.efficiency_score,
+                                "target_stability_score": v2_result.target_stability_score,
+                                "raw_metrics": v2_result.raw_metrics,
+                                "metric_scores": v2_result.metric_scores,
+                                "config_version": v2_result.config_version,
+                                "strongest_category": v2_result.strongest_category,
+                                "weakest_category": v2_result.weakest_category,
+                                "feedback": v2_result.feedback,
+                                "warnings": v2_result.warnings,
+                            }
+                            append_diag(
+                                st.session_state,
+                                f"v2_shadow trial={trial_id} overall={v2_result.overall_score:.1f}",
+                            )
+                    except Exception as v2_exc:  # noqa: BLE001
+                        append_diag(st.session_state, f"v2_shadow_failed {v2_exc}")
             return
 
         if " good/bad=" in line or line.startswith("calibration="):
@@ -397,12 +598,268 @@ def ingest_line(line: str) -> None:
             st.session_state.threshold_buffer.append(line)
             if "----------" in line and len(st.session_state.threshold_buffer) > 2:
                 st.session_state.thresholds = parse_threshold_block(st.session_state.threshold_buffer)
+                from operating_mode import persist_thresholds_for_active_mode
+
+                persist_thresholds_for_active_mode(st.session_state)
                 st.session_state.threshold_buffer = []
             return
 
     except Exception as exc:  # noqa: BLE001
         st.session_state.last_parse_error = str(exc)
         st.session_state.parse_error_count = int(st.session_state.get("parse_error_count", 0)) + 1
+        append_diag(st.session_state, f"parse_error {exc}")
+
+
+def _v2_result_dict(result: Any) -> dict[str, Any]:
+    return {
+        "overall_score": result.overall_score,
+        "control_score": result.control_score,
+        "efficiency_score": result.efficiency_score,
+        "target_stability_score": result.target_stability_score,
+        "raw_metrics": result.raw_metrics,
+        "metric_scores": result.metric_scores,
+        "config_version": result.config_version,
+        "strongest_category": result.strongest_category,
+        "weakest_category": result.weakest_category,
+        "feedback": result.feedback,
+        "warnings": result.warnings,
+    }
+
+
+def _update_live_v2_and_feedback(live: dict[str, Any]) -> None:
+    from scoring.v2.feedback import rate_limited_feedback, select_feedback
+    from scoring.v2.live_scorer import LiveV2State, compute_live_v2
+
+    session = str(st.session_state.get("session", "")).upper()
+    if session != "RUNNING":
+        return
+
+    prev_obj = st.session_state.get("live_v2_obj")
+    prev = prev_obj if isinstance(prev_obj, LiveV2State) else None
+    elapsed = safe_int(live.get("elapsed_ms", st.session_state.get("elapsed_ms", 0)))
+    from operating_mode import get_active_mode
+    from scoring.v2.config import load_active_v2_config
+    from storage import get_store
+
+    v2_cfg = load_active_v2_config(get_store, mode=get_active_mode(st.session_state))
+    state = compute_live_v2(live, elapsed, prev, config=v2_cfg)
+    st.session_state.live_v2_obj = state
+    st.session_state.live_v2 = {
+        "displayed_score": state.displayed_score,
+        "raw_overall": state.raw_overall,
+        "control_score": state.control_score,
+        "efficiency_score": state.efficiency_score,
+        "target_stability_score": state.target_stability_score,
+        "phase": state.phase,
+        "is_provisional": state.is_provisional,
+    }
+    st.session_state.live_v2_score = int(state.displayed_score)
+
+    try:
+        gyro = float(live.get("gyro_rms", 0) or 0)
+    except (TypeError, ValueError):
+        gyro = 0.0
+    try:
+        jerk = float(live.get("jerk_rms", 0) or 0)
+    except (TypeError, ValueError):
+        jerk = 0.0
+    try:
+        spike = float(live.get("spike_rate", 0) or 0)
+    except (TypeError, ValueError):
+        spike = 0.0
+    stable_raw = live.get("stable")
+    stable = safe_int(stable_raw) if stable_raw is not None else None
+    occ_raw = live.get("occ", live.get("occluded"))
+    occ = safe_int(occ_raw) if occ_raw is not None else None
+
+    new_fb = select_feedback(
+        phase=state.phase,
+        live=live,
+        gyro=gyro,
+        jerk=jerk,
+        spike=spike,
+        stable=stable,
+        occ=occ,
+    )
+    msg, ts = rate_limited_feedback(
+        new_fb,
+        last_msg=str(st.session_state.get("immediate_feedback", "")),
+        last_change_ts=float(st.session_state.get("feedback_last_change", 0.0)),
+        phase=state.phase,
+        prev_phase=str(st.session_state.get("feedback_last_phase", "")),
+    )
+    st.session_state.immediate_feedback = msg
+    st.session_state.feedback_last_change = ts
+    st.session_state.feedback_last_phase = state.phase
+
+
+def _bump_trial_data_version() -> None:
+    st.session_state.trial_data_version = int(st.session_state.get("trial_data_version", 0)) + 1
+
+
+def _resolve_firmware_trial_id(fin: dict[str, Any], explicit: int | None) -> int | None:
+    if explicit is not None:
+        return explicit
+    raw = fin.get("trial")
+    if raw is not None:
+        tid = safe_int(raw, default=-1)
+        if tid >= 0:
+            return tid
+    cur = st.session_state.get("current_trial")
+    if cur is not None:
+        tid = safe_int(cur, default=-1)
+        if tid > 0:
+            return tid
+    ctx = st.session_state.get("active_trial_context") or {}
+    fw = ctx.get("firmware_trial_id")
+    if fw is not None:
+        tid = safe_int(fw, default=-1)
+        if tid > 0:
+            return tid
+    return None
+
+
+def _phase_timestamps_for_validity(fin: dict[str, Any]) -> dict[str, Any]:
+    from scoring.v2.validity import required_hover_dwell_ms
+
+    pts = dict(st.session_state.get("phase_timestamps") or {})
+    if pts.get("hover_complete"):
+        return pts
+    hover_ms = fin.get("hover_ms")
+    required = required_hover_dwell_ms(st.session_state.get("thresholds"))
+    try:
+        if int(float(hover_ms)) >= int(required * 0.95):
+            pts["hover_complete"] = pts.get("hover_enter") or datetime.now().isoformat(timespec="seconds")
+    except (TypeError, ValueError):
+        pass
+    return pts
+
+
+def _record_save_debug(*, stage: str, detail: str = "", error: str = "") -> None:
+    st.session_state.debug_last_save_attempt = f"{stage}: {detail}".strip(": ")
+    if error:
+        st.session_state.debug_last_db_error = error
+    try:
+        st.session_state.debug_db_row_count = get_store().count_trials()
+    except Exception:
+        pass
+
+
+def _trial_save_key(trial_id: int, mode: str) -> str:
+    return f"{trial_id}:{mode}"
+
+
+def _persist_completed_trial(fin: dict[str, Any], trial_id: int | None) -> int | None:
+    trial_id = _resolve_firmware_trial_id(fin, trial_id)
+    if trial_id is None:
+        reason = "missing firmware trial_id in FINAL_SCORE and session context"
+        append_diag(st.session_state, f"db_save_skipped {reason}")
+        _record_save_debug(stage="skipped", detail=reason, error=reason)
+        return None
+
+    saved: set[str] = st.session_state.setdefault("db_saved_trials", set())
+    trial_mode_guess = str(
+        (context_for_save(st.session_state) or {}).get("mode")
+        or st.session_state.get("operating_mode", "open")
+    )
+    save_key = _trial_save_key(int(trial_id), trial_mode_guess)
+    if save_key in saved:
+        reason = f"session duplicate firmware trial_id={trial_id} mode={trial_mode_guess}"
+        append_diag(st.session_state, f"db_duplicate_ignored {reason}")
+        _record_save_debug(stage="skipped", detail=reason)
+        return None
+
+    append_diag(st.session_state, f"trial_save_requested trial={trial_id}")
+    _record_save_debug(stage="requested", detail=f"trial_id={trial_id}")
+    try:
+        from scoring.v2.live_scorer import final_v2_from_trial
+        from scoring.v2.validity import assess_trial_validity
+        from operating_mode import get_active_mode
+        from scoring.v2.config import load_active_v2_config
+
+        phase_ts = _phase_timestamps_for_validity(fin)
+        valid, status_msg = assess_trial_validity(
+            fin,
+            thresholds=st.session_state.get("thresholds"),
+            phase_timestamps=phase_ts,
+        )
+        st.session_state.trial_valid = valid
+        st.session_state.trial_status_message = status_msg
+
+        ctx = context_for_save(st.session_state)
+        if not ctx:
+            append_diag(st.session_state, "trial_save_context_missing using anonymous defaults")
+        trial_mode = str((ctx or {}).get("mode") or get_active_mode(st.session_state))
+        v2_cfg = load_active_v2_config(get_store, mode=trial_mode)
+        v2 = final_v2_from_trial(fin, config=v2_cfg)
+        v2_dict = _v2_result_dict(v2)
+        if fin.get("course_jerk_rms") is not None:
+            v2_dict.setdefault("raw_metrics", {})["course_jerk_rms"] = safe_float(fin.get("course_jerk_rms"))
+        if fin.get("hover_jerk_rms") is not None:
+            v2_dict.setdefault("raw_metrics", {})["hover_jerk_rms"] = safe_float(fin.get("hover_jerk_rms"))
+        st.session_state.latest_v2_final = v2_dict
+
+        source_type = str((ctx or {}).get("source_type") or "normal")
+        manual_label = (ctx or {}).get("manual_label") if source_type == "manual_calibration" else None
+        user_name = (ctx or {}).get("operator_name")
+        notes = (ctx or {}).get("notes")
+        append_diag(
+            st.session_state,
+            f"trial_save_operator trial={trial_id} user={user_name or 'anonymous'} valid={valid}",
+        )
+
+        if not valid:
+            append_diag(st.session_state, f"trial_validity_failed trial={trial_id} {status_msg}")
+            _record_save_debug(stage="validity_failed", detail=status_msg)
+
+        if source_type == "manual_calibration":
+            st.session_state.calibration_pending = False
+
+        # Calibration rows are always stored for threshold tuning when firmware finishes.
+        save_valid = True if source_type == "manual_calibration" else valid
+        is_conference = (
+            bool((ctx or {}).get("conference_mode"))
+            and source_type == "normal"
+            and save_valid
+            and bool(user_name)
+        )
+
+        store = get_store()
+        row_id, err = store.save_completed_trial(
+            trial_id=int(trial_id),
+            user_name=user_name,
+            source_type=source_type,
+            manual_label=manual_label,
+            v1_score=float(fin["total"]) if fin.get("total") is not None else None,
+            v2_result=v2_dict,
+            phase_timestamps=phase_ts,
+            notes=notes,
+            valid=save_valid,
+            mode=trial_mode,
+            conference_mode=is_conference,
+        )
+        if row_id is not None:
+            saved.add(_trial_save_key(int(trial_id), trial_mode))
+            st.session_state.latest_saved_trial_id = row_id
+            _bump_trial_data_version()
+            st.session_state.debug_last_saved_trial_id = row_id
+            st.session_state.debug_last_db_error = ""
+            _record_save_debug(stage="inserted", detail=f"row={row_id} valid={save_valid}")
+            append_diag(
+                st.session_state,
+                f"db_insert_ok trial={trial_id} row={row_id} valid={save_valid} refresh=v{st.session_state.trial_data_version}",
+            )
+            return row_id
+
+        reason = err or f"unknown failure firmware trial_id={trial_id}"
+        append_diag(st.session_state, f"db_save_failed trial={trial_id} {reason}")
+        _record_save_debug(stage="failed", detail=reason, error=reason)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        reason = str(exc)
+        append_diag(st.session_state, f"db_save_failed {reason}")
+        _record_save_debug(stage="exception", error=reason)
+        return None
 
 
 def upsert_completed_trial(fin: dict[str, Any]) -> None:
@@ -557,91 +1014,226 @@ _POLL_INTERVAL = timedelta(seconds=POLL_FRAGMENT_SEC)
 
 
 def connection_health_label() -> tuple[str, str]:
-    if not st.session_state.get("connected"):
-        return "Disconnected", "conn-off"
-    last = st.session_state.get("last_data_ts")
-    if last is None or (time.time() - float(last)) > DATA_QUIET_SEC:
-        return "Connected — quiet", "conn-warn"
-    return "Receiving data", "conn-ok"
+    sync_session_connection_state(st.session_state)
+    label = sm_health_label()
+    fw_state = str(st.session_state.get("current_state", "IDLE")).upper()
+    session = str(st.session_state.get("session", "IDLE")).upper()
+    if label == "Device Connected" and sm_is_connected():
+        if fw_state == "ERROR" or session == "ERROR":
+            return "Sensor unavailable", "conn-warn"
+        hw_imu = int(st.session_state.get("hw_imu", 0) or 0)
+        hw_apds = int(st.session_state.get("hw_apds", 0) or 0)
+        last = st.session_state.get("last_data_ts")
+        receiving = last is not None and (time.time() - float(last)) <= DATA_QUIET_SEC
+        if receiving and hw_imu and hw_apds:
+            return "Firmware Ready", "conn-ok"
+        if receiving and hw_imu:
+            return "Sensor Ready", "conn-ok"
+    css = {
+        "Disconnected": "conn-off",
+        "Connecting…": "conn-warn",
+        "Connection Failed": "conn-warn",
+        "Port Busy": "conn-warn",
+        "Device Lost": "conn-warn",
+        "Device Connected": "conn-ok",
+        "Sensor Ready": "conn-ok",
+        "Firmware Ready": "conn-ok",
+        "Sensor unavailable": "conn-warn",
+    }.get(label, "conn-off")
+    return label, css
 
 
 def render_connection_status() -> None:
     label, css = connection_health_label()
     port = st.session_state.get("serial_port") or "—"
-    st.markdown(f"**Status:** <span class='{css}'>{label}</span>", unsafe_allow_html=True)
-    st.caption(f"Port: `{port}` · {BAUD} baud")
-    if st.session_state.get("last_serial_error"):
-        st.warning(st.session_state.last_serial_error)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Events", st.session_state.event_count)
-    c2.metric("LIVE", st.session_state.live_count)
-    c3.metric("Finals", st.session_state.final_count)
-    if st.session_state.get("last_parse_error"):
-        st.caption(f"Last parse error: {st.session_state.last_parse_error}")
-    st.caption(f"Parse errors: {st.session_state.parse_error_count}")
+    fw_state = str(st.session_state.get("current_state", "IDLE")).upper()
+    st.markdown(f"**{label}**", unsafe_allow_html=True)
+    st.caption(f"Port {port} · {fw_state}")
+    if label in ("Disconnected", "Connection Failed", "Port Busy"):
+        if sm_last_error():
+            st.caption(sm_last_error()[:120])
+        if label == "Port Busy":
+            st.caption("Close PlatformIO monitor, Arduino Serial Monitor, or other COM tools, then Disconnect and Connect again.")
+        else:
+            st.caption("Connect a device to begin training.")
+    elif label == "Sensor unavailable":
+        st.caption("Check sensors and press Reset on the device.")
+    elif label == "Firmware Ready":
+        st.caption("Ready for trial.")
+    with st.expander("Debug log", expanded=False):
+        if st.session_state.get("last_serial_error"):
+            st.text(st.session_state.last_serial_error)
+        st.caption(
+            f"Events {st.session_state.event_count} · LIVE {st.session_state.live_count} · "
+            f"Finals {st.session_state.final_count}"
+        )
+        diag = st.session_state.get("diag_log") or []
+        if diag:
+            st.code("\n".join(diag[-12:]))
+
+
+def render_connection_controls(*, key_prefix: str = "sidebar", compact: bool = False) -> None:
+    """COM port selector, Connect/Disconnect, and status. Used in sidebar and main area."""
+    from operating_mode import render_operating_mode_switch
+    from conference_mode import render_conference_mode_controls
+
+    render_operating_mode_switch(key_prefix=key_prefix)
+    render_conference_mode_controls(key_prefix=key_prefix)
+    st.divider()
+    ports = list_serial_ports()
+    if not ports and compact:
+        st.warning("No COM ports detected — plug in the device and refresh.")
+    idx = 0
+    if ports and st.session_state.serial_port in ports:
+        idx = ports.index(st.session_state.serial_port)
+    connected = sm_is_connected()
+    sync_session_connection_state(st.session_state)
+
+    if compact:
+        st.markdown('<div class="so-connection-main">', unsafe_allow_html=True)
+        st.markdown("**Device connection**")
+        c1, c2, c3 = st.columns([3, 1, 1])
+        with c1:
+            port = st.selectbox(
+                "COM port",
+                ports or ["—"],
+                index=idx if ports else 0,
+                key=f"{key_prefix}_com_port",
+            )
+        with c2:
+            if st.button(
+                "Connect",
+                type="primary",
+                disabled=not ports or port == "—" or connected,
+                use_container_width=True,
+                key=f"{key_prefix}_connect",
+            ):
+                connect_serial(port)
+        with c3:
+            if st.button(
+                "Disconnect",
+                disabled=not connected,
+                use_container_width=True,
+                key=f"{key_prefix}_disconnect",
+            ):
+                disconnect_serial()
+                st.session_state.auto_connect_tried = False
+        label, _ = connection_health_label()
+        fw_state = str(st.session_state.get("current_state", "IDLE")).upper()
+        session = str(st.session_state.get("session", "IDLE")).upper()
+        active_port = st.session_state.get("serial_port") or port
+        st.caption(f"**{label}** · {active_port} · firmware {fw_state} · session {session}")
+        if not connected and sm_last_error():
+            st.caption(sm_last_error()[:160])
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    if not ports:
+        st.caption("No COM ports detected.")
+    port = st.selectbox(
+        "COM port",
+        ports or ["—"],
+        index=idx if ports else 0,
+        key=f"{key_prefix}_com_port",
+    )
+    render_connection_status()
+    c1, c2 = st.columns(2)
+    if c1.button(
+        "Connect",
+        type="primary",
+        disabled=not ports or port == "—" or connected,
+        use_container_width=True,
+        key=f"{key_prefix}_connect",
+    ):
+        connect_serial(port)
+    if c2.button(
+        "Disconnect",
+        disabled=not connected,
+        use_container_width=True,
+        key=f"{key_prefix}_disconnect",
+    ):
+        disconnect_serial()
+        st.session_state.auto_connect_tried = False
 
 
 def list_serial_ports() -> list[str]:
     return sorted({p.device for p in serial.tools.list_ports.comports()})
 
 
-def connect_serial(port: str) -> bool:
-    disconnect_serial()
+def _ingest_serial_line(line: str) -> None:
+    st.session_state.last_line = line[:120]
+    st.session_state.lines_received = int(st.session_state.get("lines_received", 0)) + 1
+    ingest_line(line)
+
+
+def _drain_serial_lines(ser: serial.Serial | None, max_wait_sec: float = 0.0) -> int:
+    """Drain background reader queue; optionally wait for new lines after a command."""
+    n_before = int(st.session_state.get("lines_received", 0))
+    sm_drain_lines(_ingest_serial_line)
+    sync_session_connection_state(st.session_state)
+    if max_wait_sec <= 0:
+        return int(st.session_state.get("lines_received", 0)) - n_before
+    deadline = time.time() + max_wait_sec
+    while time.time() < deadline:
+        sm_drain_lines(_ingest_serial_line)
+        sync_session_connection_state(st.session_state)
+        time.sleep(0.02)
+    return int(st.session_state.get("lines_received", 0)) - n_before
+
+
+def sync_serial_after_connect() -> None:
+    """Reset firmware to IDLE and ingest the EVENT so UI matches the board."""
+    ser = get_serial()
+    if not ser or not sm_is_connected():
+        return
     try:
-        ser = serial.Serial(port, BAUD, timeout=0)
-        st.session_state.serial_conn = ser
-        st.session_state.serial_port = port
-        st.session_state.connected = True
-        st.session_state.last_serial_error = ""
-        return True
+        time.sleep(0.15)
+        ser.reset_input_buffer()
+        ser.write(b"r")
+        ser.flush()
+        _drain_serial_lines(ser, SYNC_READ_SEC)
+        if str(st.session_state.get("current_state", "")).upper() != "IDLE":
+            st.session_state.current_state = "IDLE"
+        st.session_state.session = "READY"
+        st.session_state.current_feedback = "Synced with board — press START TRIAL"
+        st.session_state.sync_message = "Board reset to IDLE on connect"
     except Exception as exc:  # noqa: BLE001
         st.session_state.last_serial_error = str(exc)
-        st.session_state.connected = False
-        st.session_state.serial_conn = None
-        return False
+
+
+def connect_serial(port: str, *, sync: bool = True) -> bool:
+    ok = sm_connect(port, log=_serial_log)
+    if not ok and sm_connection_status_port_busy():
+        append_diag(st.session_state, "connect_retry after release")
+        sm_disconnect(log=_serial_log)
+        time.sleep(0.35)
+        ok = sm_connect(port, log=_serial_log)
+    sync_session_connection_state(st.session_state)
+    if ok:
+        st.session_state.sync_message = ""
+        if sync:
+            sync_serial_after_connect()
+        return True
+    st.session_state.sync_message = ""
+    return False
 
 
 def disconnect_serial() -> None:
-    ser = st.session_state.get("serial_conn")
-    if ser is not None:
-        try:
-            if getattr(ser, "is_open", False):
-                ser.close()
-        except Exception:  # noqa: BLE001
-            pass
-    st.session_state.serial_conn = None
-    st.session_state.connected = False
+    sm_disconnect(log=_serial_log)
+    sync_session_connection_state(st.session_state)
 
 
 def send_serial_command(cmd: str) -> None:
-    ser = st.session_state.get("serial_conn")
-    if not ser or not st.session_state.get("connected"):
-        st.session_state.last_serial_error = "Not connected"
-        return
-    try:
-        ser.write(cmd.encode("ascii"))
-        ser.flush()
-    except Exception as exc:  # noqa: BLE001
-        st.session_state.last_serial_error = str(exc)
+    if not sm_write_command(cmd, log=_serial_log):
+        sync_session_connection_state(st.session_state)
 
 
 def _read_serial_nonblocking() -> None:
-    ser = st.session_state.get("serial_conn")
-    if not ser or not st.session_state.get("connected"):
+    if not sm_is_connected():
+        sync_session_connection_state(st.session_state)
         return
-    try:
-        while ser.in_waiting > 0:
-            raw = ser.readline()
-            if not raw:
-                break
-            line = raw.decode("utf-8", errors="ignore").strip()
-            if line:
-                st.session_state.last_line = line[:120]
-                st.session_state.lines_received = int(st.session_state.get("lines_received", 0)) + 1
-                ingest_line(line)
-    except Exception as exc:  # noqa: BLE001
-        st.session_state.last_serial_error = str(exc)
-        disconnect_serial()
+    sm_drain_lines(_ingest_serial_line)
+    sync_session_connection_state(st.session_state)
 
 
 def run_demo_trial() -> None:
@@ -726,7 +1318,16 @@ def init_session_state() -> None:
         "latest_live": None,
         "latest_final": None,
         "current_state": "IDLE",
+        "session": "IDLE",
         "current_trial": 0,
+        "elapsed_ms": 0,
+        "hw_imu": 0,
+        "hw_apds": 0,
+        "hw_oled": 0,
+        "coach_display": "Connect hardware or press Start.",
+        "coach_pending": "",
+        "coach_pending_since": 0.0,
+        "metric_labels": {},
         "live_score": 0,
         "current_feedback": "",
         "prev_score": 0,
@@ -744,6 +1345,8 @@ def init_session_state() -> None:
         "demo_running": False,
         "demo_phase": 0,
         "demo_phase_ts": 0.0,
+        "auto_connect_tried": False,
+        "sync_message": "",
         "show_radar_review": False,
         "lines_received": 0,
         "last_poll_lines": 0,
@@ -752,6 +1355,46 @@ def init_session_state() -> None:
         "poll_tick": 0,
         "polling_mode": "fragment" if _HAS_FRAGMENT else "fallback",
         "last_rerun_ts": 0.0,
+        "last_plot_refresh_ts": 0.0,
+        "diag_log": [],
+        "finalized_trial_ids": set(),
+        "v2_shadow_logged": set(),
+        "latest_v2_preview": None,
+        "latest_v2_final": None,
+        "live_v2": None,
+        "live_v2_obj": None,
+        "live_v2_score": 0,
+        "immediate_feedback": "Smooth and controlled",
+        "feedback_last_change": 0.0,
+        "feedback_last_phase": "approach",
+        "user_name_input": "",
+        "calibration_pending": False,
+        "calibration_label": None,
+        "calibration_operator": None,
+        "calibration_note": "",
+        "trial_valid": True,
+        "trial_status_message": "",
+        "calibration_label_choice": None,
+        "connection_status": "disconnected",
+        "nav_page": "Live Trial",
+        "active_page": "Live Trial",
+        "pending_page": None,
+        "trial_data_version": 0,
+        "latest_saved_trial_id": None,
+        "breakdown_trial_id": None,
+        "active_trial_context": None,
+        "operating_mode": "open",
+        "conference_mode": False,
+        "thresholds_by_mode": {},
+        "live_metrics_last": {},
+        "live_chart_series": [],
+        "db_saved_trials": set(),
+        "phase_timestamps": {},
+        "debug_last_final_score": "—",
+        "debug_last_save_attempt": "—",
+        "debug_last_saved_trial_id": "—",
+        "debug_last_db_error": "—",
+        "debug_db_row_count": 0,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -764,28 +1407,31 @@ def init_session_state() -> None:
     sync_message_counts()
 
 
+def render_db_debug_panel() -> None:
+    """Developer diagnostics for trial persistence (not shown in normal workflow)."""
+    with st.expander("Trial save diagnostics", expanded=False):
+        try:
+            row_count = get_store().count_trials()
+            valid_count = get_store().count_trials(valid_only=True)
+        except Exception as exc:  # noqa: BLE001
+            row_count = -1
+            valid_count = -1
+            st.session_state.debug_last_db_error = str(exc)
+        st.text(f"Last FINAL_SCORE received: {st.session_state.get('debug_last_final_score', '—')}")
+        st.text(f"Last database save attempt: {st.session_state.get('debug_last_save_attempt', '—')}")
+        st.text(f"Last saved trial ID (db row): {st.session_state.get('debug_last_saved_trial_id', '—')}")
+        st.text(f"Last database error: {st.session_state.get('debug_last_db_error', '—') or '—'}")
+        st.text(f"Current database row count: {row_count} total / {valid_count} valid")
+        st.text(f"trial_data_version: {st.session_state.get('trial_data_version', 0)}")
+        ctx = st.session_state.get("active_trial_context")
+        if ctx:
+            st.caption(f"Active trial context: user={ctx.get('operator_name')} trial={ctx.get('firmware_trial_id')}")
+
+
 def render_sidebar_diagnostics() -> None:
-    render_connection_status()
-    st.markdown("### Polling")
-    st.caption(f"Mode: **{st.session_state.polling_mode}**")
-    st.caption(f"Last poll: {st.session_state.last_poll_time}")
-    st.caption(f"Lines this poll: {st.session_state.last_poll_lines}")
-    st.caption(f"Total lines: {st.session_state.lines_received}")
-    st.caption(f"Poll ticks: {st.session_state.poll_tick}")
-    last = st.session_state.get("last_line", "—")
-    if last and last != "—":
-        st.caption(f"Last line: {last[:72]}…" if len(str(last)) > 72 else f"Last line: {last}")
-    b1, b2 = st.columns(2)
-    if b1.button("Poll now", key="btn_poll_now", use_container_width=True):
-        _poll_serial_core()
-    if b2.button("Force rerun", key="btn_force_rerun", use_container_width=True):
-        st.rerun()
-    th = st.session_state.thresholds
-    if th:
-        st.caption(
-            "Thresholds loaded"
-            + (" (calibration active)" if safe_get(th, "calibration_active") else "")
-        )
+    if st.session_state.get("sync_message"):
+        st.caption(st.session_state.sync_message)
+    render_db_debug_panel()
 
 
 def _metric_html(label: str, value: str) -> str:
@@ -1209,6 +1855,7 @@ def render_debug_tab() -> None:
         ("x", "Raw CSV (x)"),
         ("r", "Reset (r)"),
         ("s", "Start (s)"),
+        ("e", "Stop (e)"),
         ("d", "Dock sim (d)"),
     ]
     cols = st.columns(3)
@@ -1225,20 +1872,9 @@ if _HAS_FRAGMENT:
         render_sidebar_diagnostics()
 
     @st.fragment(run_every=_POLL_INTERVAL)
-    def live_coach_panel_fragment() -> None:
-        render_live_coach_tab()
-
-    @st.fragment(run_every=_POLL_INTERVAL)
-    def trial_review_panel_fragment() -> None:
-        render_trial_review_tab()
-
-    @st.fragment(run_every=_POLL_INTERVAL)
-    def history_panel_fragment() -> None:
-        render_history_tab()
-
-    @st.fragment(run_every=_POLL_INTERVAL)
-    def debug_panel_fragment() -> None:
-        render_debug_tab()
+    def demo_panel_fragment() -> None:
+        _poll_serial_core()
+        render_demo_main_panel()
 
 else:
 
@@ -1246,17 +1882,249 @@ else:
         _poll_serial_core()
         render_sidebar_diagnostics()
 
-    def live_coach_panel_fragment() -> None:
-        render_live_coach_tab()
+    def demo_panel_fragment() -> None:
+        render_demo_main_panel()
 
-    def trial_review_panel_fragment() -> None:
-        render_trial_review_tab()
 
-    def history_panel_fragment() -> None:
-        render_history_tab()
+def session_action(cmd: str, *, source: str = "dashboard") -> None:
+    """Shared serial actions for on-screen and physical button parity."""
+    append_diag(st.session_state, f"cmd_sent {cmd} source={source}")
+    send_serial_command(cmd)
+    sm_drain_lines(_ingest_serial_line)
+    sync_session_connection_state(st.session_state)
 
-    def debug_panel_fragment() -> None:
-        render_debug_tab()
+
+def update_coach_hysteresis(message: str) -> None:
+    msg = (message or "").strip() or "Maintain this motion."
+    now = time.time()
+    if msg == st.session_state.coach_display:
+        return
+    if msg != st.session_state.get("coach_pending"):
+        st.session_state.coach_pending = msg
+        st.session_state.coach_pending_since = now
+    elif now - float(st.session_state.coach_pending_since) >= COACH_HYSTERESIS_SEC:
+        st.session_state.coach_display = msg
+
+
+def rating_label(value: float, good: float, bad: float, invert: bool = False) -> str:
+    if invert:
+        if value <= good:
+            return "Excellent"
+        if value <= bad * 0.7:
+            return "Good"
+        if value <= bad:
+            return "Adjust"
+        return "Unstable"
+    if value <= good:
+        return "Excellent"
+    if value <= bad * 0.6:
+        return "Good"
+    if value <= bad:
+        return "Adjust"
+    return "Unstable"
+
+
+def derive_live_categories(live: dict[str, Any]) -> dict[str, str]:
+    gyro = safe_float(safe_get(live, "gyro_rms"))
+    jerk = safe_float(safe_get(live, "jerk_rms"))
+    spike = safe_float(safe_get(live, "spike_rate"))
+    stable = safe_int(safe_get(live, "stable"))
+    occ = safe_int(safe_get(live, "occ", safe_get(live, "occluded")))
+    phase = str(safe_get(live, "state", st.session_state.current_state)).upper()
+
+    smooth = rating_label(max(gyro, jerk / 20.0), 120, 260)
+    if phase == "HOVER":
+        steady = "Excellent" if stable else "Unstable"
+        if stable and gyro > 150:
+            steady = "Adjust"
+    else:
+        steady = rating_label(gyro, 100, 200)
+    if occ == 1:
+        target = "Excellent" if phase in ("HOVER", "DOCK") else "Good"
+    elif phase in ("HOVER", "DOCK", "APPROACH"):
+        target = "Adjust"
+    else:
+        target = "Good"
+    efficiency = rating_label(spike, 4, 10, invert=True) if spike else "Good"
+    return {
+        "Smoothness": smooth,
+        "Steadiness": steady,
+        "Target control": target,
+        "Efficiency": efficiency,
+    }
+
+
+def coaching_message(live: dict[str, Any], categories: dict[str, str]) -> str:
+    issue = str(safe_get(live, "issue", st.session_state.current_feedback) or "")
+    low = issue.lower()
+    if categories.get("Target control") in ("Adjust", "Unstable"):
+        return "Return toward the target."
+    if "hold" in low or categories.get("Steadiness") == "Unstable":
+        return "Hold steadily."
+    if "slow" in low or categories.get("Smoothness") in ("Adjust", "Unstable"):
+        return "Reduce sudden movement."
+    if "cover" in low or "target" in low:
+        return "Slow your target approach."
+    if occ := safe_int(safe_get(live, "occ", safe_get(live, "occluded"))):
+        if occ == 1:
+            return "Target acquired."
+    if categories.get("Smoothness") == "Excellent":
+        return "Maintain this motion."
+    return issue or "Move smoothly through the course."
+
+
+def session_status_meta() -> tuple[str, str, str]:
+    session = str(st.session_state.get("session", "IDLE")).upper()
+    mapping = {
+        "IDLE": ("SYSTEM IDLE", "dot-idle", "gray"),
+        "READY": ("SYSTEM READY", "dot-ready", "blue"),
+        "RUNNING": ("TRIAL RUNNING", "dot-running", "green"),
+        "COMPLETE": ("TRIAL COMPLETE", "dot-complete", "gold"),
+        "ERROR": ("SYSTEM ERROR", "dot-error", "red"),
+    }
+    return mapping.get(session, ("SYSTEM IDLE", "dot-idle", "gray"))
+
+
+def format_elapsed(ms: int) -> str:
+    sec = max(0, ms) / 1000.0
+    m = int(sec // 60)
+    s = sec % 60
+    return f"{m:02d}:{s:04.1f}" if m else f"{s:04.1f}"
+
+
+def render_demo_topbar() -> None:
+    label, dot_cls, _ = session_status_meta()
+    st.markdown(
+        f'<div class="demo-topbar">'
+        f'<div><p class="demo-title">MYOSA</p>'
+        f'<p class="demo-sub">Surgical Skill Feedback</p></div>'
+        f'<div style="font-weight:700;font-size:1rem;">'
+        f'<span class="status-dot {dot_cls}"></span>{label}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_hardware_strip() -> None:
+    imu = "✓" if st.session_state.get("hw_imu") else "✗"
+    apds = "✓" if st.session_state.get("hw_apds") else "✗"
+    oled = "✓" if st.session_state.get("hw_oled") else "✗"
+    st.markdown(
+        f'<p class="hw-strip">Instrument Sensor {imu} &nbsp;&nbsp; '
+        f'Target Sensor {apds} &nbsp;&nbsp; OLED {oled}</p>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_ready_screen() -> None:
+    flags = control_flags(str(st.session_state.get("session", "READY")))
+    st.markdown("### System Ready")
+    st.markdown("Position the instrument and press **Start**.")
+    render_hardware_strip()
+    if st.button(
+        "START TRIAL",
+        type="primary",
+        use_container_width=True,
+        disabled=not flags["start"] or not st.session_state.get("connected"),
+    ):
+        session_action("s", source="dashboard_start")
+
+
+def render_running_screen() -> None:
+    flags = control_flags("RUNNING")
+    live = st.session_state.latest_live or {}
+    categories = derive_live_categories(live)
+    st.session_state.metric_labels = categories
+    coach = coaching_message(live, categories)
+    update_coach_hysteresis(coach)
+
+    elapsed = safe_int(safe_get(live, "elapsed_ms", st.session_state.elapsed_ms))
+    score = safe_int(safe_get(live, "score", st.session_state.live_score))
+    occ = safe_int(safe_get(live, "occ", safe_get(live, "occluded")))
+    target_label = "TARGET ACQUIRED" if occ == 1 else "TARGET LOST"
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown(f'<p class="score-xl">{score}</p><p>LIVE SCORE</p>', unsafe_allow_html=True)
+        st.markdown(
+            f'<p class="time-xl">{format_elapsed(elapsed)}</p><p>ELAPSED TIME</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f"**{target_label}**")
+        st.caption(f"Phase: {st.session_state.current_state}")
+    with right:
+        st.markdown("**LIVE FEEDBACK**")
+        for name, status in categories.items():
+            st.markdown(f"● **{name}** — {status}")
+        st.markdown(
+            f'<div class="feedback-line">{st.session_state.coach_display}</div>',
+            unsafe_allow_html=True,
+        )
+
+    c1, c2 = st.columns(2)
+    if c1.button("STOP TRIAL", type="primary", use_container_width=True, disabled=not flags["stop"]):
+        session_action("e", source="dashboard_stop")
+    if c2.button("RESET", use_container_width=True, disabled=not flags["reset"]):
+        session_action("r", source="dashboard_reset")
+
+
+def render_v2_shadow_preview(final: dict[str, Any] | None = None) -> None:
+    """Developer-only experimental V2 preview; V1 firmware score remains authoritative."""
+    if not V2_SHADOW_ENABLED:
+        return
+    preview = st.session_state.get("latest_v2_preview")
+    fin = final or st.session_state.get("latest_final") or {}
+    with st.expander("EXPERIMENTAL V2 PREVIEW (shadow mode)", expanded=False):
+        st.caption("Firmware V1 FINAL_SCORE is the active conference score. V2 is not calibrated.")
+        v1_total = safe_int(safe_get(fin, "total", st.session_state.live_score))
+        st.markdown(f"**V1 firmware score:** {v1_total}")
+        if not preview:
+            st.info("V2 preview will appear after the next completed trial.")
+            return
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("V2 overall", f"{preview['overall_score']:.0f}")
+        c2.metric("Control", f"{preview['control_score']:.0f}")
+        c3.metric("Efficiency", f"{preview['efficiency_score']:.0f}")
+        c4.metric("Target stability", f"{preview['target_stability_score']:.0f}")
+        st.caption(f"Config: `{preview.get('config_version', '—')}`")
+        st.write(preview.get("feedback", ""))
+        if preview.get("warnings"):
+            for w in preview["warnings"]:
+                st.warning(w)
+        st.json(
+            {
+                "raw_metrics": preview.get("raw_metrics", {}),
+                "metric_scores": preview.get("metric_scores", {}),
+            }
+        )
+
+
+def render_complete_screen() -> None:
+    flags = control_flags("COMPLETE")
+    fin = st.session_state.latest_final or {}
+    total = safe_int(safe_get(fin, "total", st.session_state.live_score))
+    total_ms = safe_int(safe_get(fin, "total_ms", st.session_state.elapsed_ms))
+    st.markdown("### TRIAL COMPLETE")
+    st.markdown(f'<p class="score-xl">{total}</p><p>FINAL SCORE</p>', unsafe_allow_html=True)
+    st.markdown(f"**Completion time:** {format_elapsed(total_ms)} s")
+    notes = generate_positive_notes(fin) if fin else []
+    improve = generate_improvement_notes(fin) if fin else []
+    if notes:
+        st.success(notes[0])
+    if improve:
+        st.info(improve[0])
+    c1, c2 = st.columns(2)
+    if c1.button("NEW TRIAL", type="primary", use_container_width=True, disabled=not flags["reset"]):
+        session_action("r", source="dashboard_new_trial_reset")
+    if c2.button("RESET", use_container_width=True, disabled=not flags["reset"]):
+        session_action("r", source="dashboard_reset_complete")
+    render_v2_shadow_preview(fin)
+
+
+def render_demo_main_panel() -> None:
+    render_live_trial(
+        session_action=lambda cmd: session_action(cmd, source="live_trial"),
+        connected=bool(st.session_state.get("connected")),
+    )
 
 
 def _fallback_autorerun() -> None:
@@ -1271,62 +2139,36 @@ def _fallback_autorerun() -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="MYOSA Lap Trainer",
+        page_title="Smooth Operator",
         page_icon="🩺",
         layout="wide",
         initial_sidebar_state="expanded",
     )
     init_session_state()
-    inject_custom_css()
+    inject_theme()
+    render_app_header()
 
     with st.sidebar:
-        st.header("Connection")
-        ports = list_serial_ports()
-        if not ports:
-            st.warning("No COM ports detected.")
-        idx = 0
-        if ports and st.session_state.serial_port in ports:
-            idx = ports.index(st.session_state.serial_port)
-        port = st.selectbox("COM port", ports or ["—"], index=idx if ports else 0)
-        c1, c2 = st.columns(2)
-        if c1.button("Connect", disabled=not ports or port == "—"):
-            if connect_serial(port):
-                st.success(f"Connected to {port}")
-            else:
-                st.error(st.session_state.last_serial_error)
-        if c2.button("Disconnect"):
-            disconnect_serial()
-            st.info("Disconnected")
-        st.session_state.demo_mode = st.toggle(
-            "Demo mode (no hardware)",
-            value=bool(st.session_state.demo_mode),
-            help="Simulates EVENT/LIVE/FINAL_SCORE when not connected",
-        )
-        if st.session_state.demo_mode and not st.session_state.connected:
-            if st.button("Run demo trial", use_container_width=True):
-                reset_demo_trial()
-                st.session_state.demo_running = True
-                st.rerun()
-        if st.button("Reset session data"):
-            for k in list(st.session_state.keys()):
-                del st.session_state[k]
-            init_session_state()
-            st.rerun()
+        render_sidebar_branding()
+        st.divider()
+        render_connection_controls(key_prefix="sidebar", compact=False)
+        with st.expander("Serial debug", expanded=False):
+            render_debug_tab()
+            render_v2_shadow_preview()
         run_sidebar_poll_fragment()
 
-    tab_live, tab_review, tab_hist, tab_cal, tab_dbg = st.tabs(
-        ["Live Coach", "Trial Review", "History", "Calibration / Tuning", "Debug"]
-    )
-    with tab_live:
-        live_coach_panel_fragment()
-    with tab_review:
-        trial_review_panel_fragment()
-    with tab_hist:
-        history_panel_fragment()
-    with tab_cal:
-        render_calibration_tab()
-    with tab_dbg:
-        debug_panel_fragment()
+    page = render_page_tabs()
+
+    if page == "Live Trial":
+        demo_panel_fragment()
+    elif page == "Trial Breakdown":
+        render_trial_breakdown()
+    elif page == "Track Progress":
+        render_track_progress()
+    elif page == "Tune Scoring":
+        render_tune_scoring(session_action=lambda cmd: session_action(cmd, source="tune_scoring"))
+
+    close_page_shell()
 
     if not _HAS_FRAGMENT:
         _fallback_autorerun()

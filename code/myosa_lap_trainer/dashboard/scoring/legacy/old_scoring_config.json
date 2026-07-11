@@ -1,0 +1,135 @@
+{
+  "version": "v1_legacy",
+  "description": "Conference-safe pre-calibration scorer preserved from firmware main.cpp (ESP32). Do not modify without regression tests.",
+  "source_firmware": "src/main.cpp",
+  "component_max": {
+    "course": 35,
+    "hover": 30,
+    "axis": 15,
+    "flow": 10,
+    "target": 5,
+    "dock": 5,
+    "total": 100
+  },
+  "sampling": {
+    "sample_period_ms": 40,
+    "hover_dwell_ms": 2000,
+    "hover_time_slack_ms": 5000
+  },
+  "course": {
+    "gyro_rms_good": 130.0,
+    "gyro_rms_bad": 260.0,
+    "jerk_rms_good": 1700.0,
+    "jerk_rms_bad": 4200.0,
+    "spike_rate_good": 5.5,
+    "spike_rate_bad": 11.0,
+    "pause_min_ms": 1500,
+    "pause_bad_ms": 10000,
+    "approach_time_good_ms": 16000,
+    "approach_time_bad_ms": 40000,
+    "penalties": {
+      "gyro_rms_max": 7,
+      "jerk_rms_max": 7,
+      "spike_rate_max": 6,
+      "pause_max": 4,
+      "approach_time_max": 4
+    }
+  },
+  "hover": {
+    "gyro_rms_good": 90.0,
+    "gyro_rms_bad": 180.0,
+    "jerk_rms_good": 900.0,
+    "jerk_rms_bad": 1800.0,
+    "reset_penalty_each": 6,
+    "reset_penalty_cap": 18,
+    "unstable_frac_good": 0.30,
+    "unstable_frac_bad_default": 0.70,
+    "unstable_frac_bad_clean_complete": 0.80,
+    "unstable_penalty_max_default": 4.0,
+    "unstable_penalty_max_clean_complete": 2.0,
+    "extra_hover_time_penalty_max": 3,
+    "extra_hover_time_ramp_ms": 12000,
+    "bonus_min_score_occluded": 24,
+    "bonus_min_score_fast_hover": 25,
+    "bonus_fast_hover_ms": 4000,
+    "bonus_occluded_frac": 0.95
+  },
+  "axis": {
+    "tilt_good_deg": 12.0,
+    "tilt_warn_deg": 25.0,
+    "tilt_bad_deg": 40.0,
+    "tilt_max_bad_deg": 55.0,
+    "hover_tilt_weight": 0.6,
+    "course_tilt_weight": 0.4,
+    "penalties": {
+      "rms_max": 6,
+      "warn_time_max": 5,
+      "max_tilt_max": 4,
+      "warn_time_ramp_ms": 4000
+    }
+  },
+  "flow": {
+    "plateau_lo_ms": 25000,
+    "plateau_hi_ms": 35000,
+    "fast_lo_ms": 20000,
+    "slow_hi_ms": 45000,
+    "min_ms": 15000,
+    "max_ms": 60000
+  },
+  "target": {
+    "perfect_occluded_frac": 0.95,
+    "occluded_frac_threshold": 0.85,
+    "penalty_occluded_low": 2,
+    "penalty_occlusion_loss": 2
+  },
+  "dock": {
+    "time_good_ms": 3000,
+    "time_bad_ms": 15000,
+    "jerk_good": 500.0,
+    "jerk_bad_default": 5500.0,
+    "gyro_good": 50.0,
+    "gyro_bad": 250.0,
+    "penalties": {
+      "time_max": 2,
+      "jerk_max": 1,
+      "gyro_max": 1
+    }
+  },
+  "calibration": {
+    "enabled_default": false,
+    "ema_alpha": 0.35,
+    "course_gyro_good_scale": 1.15,
+    "course_gyro_good_floor": 80.0,
+    "course_gyro_bad_scale": 2.2,
+    "course_gyro_bad_min_offset": 40.0,
+    "course_jerk_good_scale": 1.15,
+    "course_jerk_good_floor": 600.0,
+    "course_jerk_bad_scale": 2.3,
+    "course_jerk_bad_min_offset": 800.0,
+    "course_spike_good_scale": 1.25,
+    "course_spike_good_floor": 2.0,
+    "course_spike_bad_scale": 2.5,
+    "course_spike_bad_offset": 2.0,
+    "hover_gyro_good_scale": 1.15,
+    "hover_gyro_good_floor": 50.0,
+    "hover_gyro_bad_scale": 2.2,
+    "hover_gyro_bad_min_offset": 30.0,
+    "hover_jerk_good_scale": 1.15,
+    "hover_jerk_good_floor": 400.0,
+    "hover_jerk_bad_scale": 2.3,
+    "hover_jerk_bad_min_offset": 500.0,
+    "dock_jerk_bad_scale": 2.5,
+    "dock_jerk_bad_floor": 4500.0
+  },
+  "feedback_thresholds": {
+    "great_control_total": 85,
+    "dock_harsh_total": 70,
+    "dock_harsh_score": 2,
+    "axis_off_axis": 10,
+    "course_jerky": 22,
+    "target_low": 3,
+    "flow_low": 7,
+    "improve_hover_course": 28,
+    "improve_hover_score": 20
+  }
+}

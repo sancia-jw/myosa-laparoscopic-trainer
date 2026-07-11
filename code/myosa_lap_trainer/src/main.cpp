@@ -28,11 +28,10 @@ constexpr int END_BUTTON_PIN = 16;
 constexpr uint8_t STATUS_LED_PIN = 2;
 
 constexpr unsigned long kSamplePeriodMs = 40;
-constexpr unsigned long kOledUpdateMs = 200;
-constexpr unsigned long kApdsPollMs = 80;
-constexpr unsigned long kButtonDebounceMs = 40;
-constexpr unsigned long kButtonActionHoldMs = 80;
-constexpr unsigned long kEndHoldMs = kButtonActionHoldMs;
+constexpr unsigned long kOledUpdateMs = 100;
+constexpr unsigned long kApdsPollMs = 50;
+constexpr unsigned long kButtonDebounceMs = 50;
+constexpr unsigned long kLivePrintMs = 200;
 constexpr unsigned long kDockIgnoreMs = 100;
 constexpr unsigned long kHoverDwellMs = 2000;
 constexpr unsigned long kOcclusionLossResetMs = 400;
@@ -72,7 +71,6 @@ constexpr float COURSE_WOBBLE_GYRO_THRESH = 140.0f;
 constexpr float HOVER_GYRO_SPIKE_THRESH = 120.0f;
 constexpr float HOVER_JERK_SPIKE_THRESH = 1200.0f;
 constexpr float kScoreCalEmaAlpha = 0.35f;
-constexpr unsigned long kLivePrintMs = 1500;
 constexpr uint8_t kRollWinSize = 25;
 constexpr unsigned long HOVER_TIME_SLACK_MS = 5000;
 
@@ -112,6 +110,14 @@ enum class TrialState : uint8_t {
   Complete,
 };
 
+enum class SessionState : uint8_t {
+  Idle,
+  Ready,
+  Running,
+  Complete,
+  Error,
+};
+
 namespace {
 
 LightProximityAndGesture apds;
@@ -124,6 +130,12 @@ bool g_oled_ok = false;
 bool g_stream_raw_csv = STREAM_RAW_CSV_DEFAULT;
 
 TrialState g_state = TrialState::Idle;
+SessionState g_session = SessionState::Idle;
+bool g_oled_force_refresh = true;
+bool g_trial_finalize_once = false;
+bool g_final_score_printed = false;
+uint16_t g_last_final_score_trial_id = 0;
+unsigned long g_trial_running_start_ms = 0;
 uint16_t g_trial_id = 0;
 unsigned long g_sample_index = 0;
 unsigned long g_next_sample_ms = 0;
@@ -986,6 +998,12 @@ void printScoreSummary() {
   if (!g_metrics.got_dock_complete) {
     return;
   }
+  if (g_final_score_printed && g_last_final_score_trial_id == g_metrics.trial_id) {
+    Serial.println(F("# final_score_duplicate_ignored"));
+    return;
+  }
+  g_final_score_printed = true;
+  g_last_final_score_trial_id = g_metrics.trial_id;
   const float course_gyro_rms =
       computeRms(g_metrics.course_gyro_sumsq, g_metrics.course_sample_count);
   const float course_jerk_rms =
@@ -1059,7 +1077,17 @@ void printScoreSummary() {
   Serial.print(F(",hover_resets="));
   Serial.print(g_metrics.hover_reset_count);
   Serial.print(F(",occlusion_losses="));
-  Serial.println(g_metrics.occlusion_loss_count);
+  Serial.print(g_metrics.occlusion_loss_count);
+  const float hover_gyro_rms =
+      computeRms(g_metrics.hover_gyro_sumsq, g_metrics.hover_total_samples);
+  const float hover_jerk_rms =
+      computeRms(g_metrics.hover_jerk_sumsq, g_metrics.hover_total_samples);
+  Serial.print(F(",hover_gyro_rms="));
+  Serial.print(hover_gyro_rms, 1);
+  Serial.print(F(",hover_jerk_rms="));
+  Serial.print(hover_jerk_rms, 0);
+  Serial.print(F(",course_pause_ms="));
+  Serial.println(g_metrics.course_pause_time_ms);
 }
 
 void printScoreBreakdown() {
@@ -1246,7 +1274,7 @@ void applyEventToMetrics(const char *event, unsigned long t_ms) {
     scoreHoverPrecision(&g_metrics, nullptr);
     strncpy(g_previous_phase_name, "Hover", sizeof(g_previous_phase_name) - 1);
     g_previous_phase_score = g_metrics.hover_score;
-  } else if (strcmp(event, "DOCK_COMPLETE") == 0) {
+  } else if (strcmp(event, "DOCK_COMPLETE") == 0 || strcmp(event, "STOP_COMPLETE") == 0) {
     g_metrics.got_dock_complete = true;
     g_metrics.dock_complete_ms = t_ms;
     computeFinalScore();
@@ -1282,7 +1310,7 @@ void processAllPendingEvents(unsigned long t_ms) {
 
     applyEventToMetrics(ev, t_ms);
 
-    if (strcmp(ev, "DOCK_COMPLETE") == 0) {
+    if (strcmp(ev, "DOCK_COMPLETE") == 0 || strcmp(ev, "STOP_COMPLETE") == 0) {
       printScoreSummary();
     }
 
@@ -1637,6 +1665,96 @@ void printButtonStatus() {
   Serial.println(g_end_action_consumed ? 1 : 0);
 }
 
+const char *sessionName(SessionState s) {
+  switch (s) {
+    case SessionState::Idle:
+      return "IDLE";
+    case SessionState::Ready:
+      return "READY";
+    case SessionState::Running:
+      return "RUNNING";
+    case SessionState::Complete:
+      return "COMPLETE";
+    case SessionState::Error:
+      return "ERROR";
+  }
+  return "IDLE";
+}
+
+void logDiag(const char *msg) {
+  Serial.print(F("# "));
+  Serial.print(millis());
+  Serial.print(F(" "));
+  Serial.println(msg);
+}
+
+void logStateTransition(SessionState prev, SessionState next, const char *source) {
+  Serial.print(F("# "));
+  Serial.print(millis());
+  Serial.print(F(" STATE "));
+  Serial.print(sessionName(prev));
+  Serial.print(F(" -> "));
+  Serial.print(sessionName(next));
+  Serial.print(F(" source="));
+  Serial.println(source);
+}
+
+void printSessionLine(const char *action = "") {
+  Serial.print(F("SESSION,session="));
+  Serial.print(sessionName(g_session));
+  Serial.print(F(",phase="));
+  Serial.print(stateName(g_state));
+  Serial.print(F(",trial="));
+  Serial.print(g_trial_id);
+  if (action != nullptr && action[0] != '\0') {
+    Serial.print(F(",action="));
+    Serial.print(action);
+  }
+  if (g_session == SessionState::Running && g_trial_running_start_ms > 0) {
+    Serial.print(F(",elapsed_ms="));
+    Serial.print(millis() - g_trial_running_start_ms);
+  }
+  Serial.print(F(",score="));
+  Serial.print(scoreForSerialOutput());
+  Serial.print(F(",imu="));
+  Serial.print(g_imu_ok ? 1 : 0);
+  Serial.print(F(",apds="));
+  Serial.print(g_apds_ok ? 1 : 0);
+  Serial.print(F(",oled="));
+  Serial.println(g_oled_ok ? 1 : 0);
+}
+
+SessionState sessionFromTrial(TrialState trial) {
+  if (trial == TrialState::Complete) {
+    return SessionState::Complete;
+  }
+  if (trial == TrialState::Idle) {
+    return SessionState::Ready;
+  }
+  return SessionState::Running;
+}
+
+void setSession(SessionState next, const char *action) {
+  if (g_session == next) {
+    return;
+  }
+  const SessionState prev = g_session;
+  g_session = next;
+  g_oled_force_refresh = true;
+  const char *src = (action != nullptr && action[0] != '\0') ? action : "internal";
+  logStateTransition(prev, next, src);
+  printSessionLine(action != nullptr ? action : "");
+}
+
+void syncSessionFromTrial(const char *action) {
+  setSession(sessionFromTrial(g_state), action);
+}
+
+bool isTrialRunning() {
+  return g_state == TrialState::Approach || g_state == TrialState::Hover ||
+         g_state == TrialState::Dock;
+}
+
 void transitionTo(TrialState next, const char *event) {
   g_state = next;
   g_state_enter_ms = millis();
@@ -1654,75 +1772,166 @@ void transitionTo(TrialState next, const char *event) {
     g_metrics.dock_jerk_peak_recent = 0.0f;
     g_metrics.dock_gyro_peak_recent = 0.0f;
   }
+  syncSessionFromTrial(event);
+  g_oled_force_refresh = true;
 }
 
-void returnToIdleFromComplete() {
+void returnToReadyFromComplete() {
   g_state = TrialState::Idle;
   g_hover_ms = 0;
   g_state_enter_ms = millis();
   g_dock_complete_consumed = false;
+  g_trial_finalize_once = false;
+  g_final_score_printed = false;
+  g_start_action_consumed = false;
+  g_end_action_consumed = false;
+  g_trial_running_start_ms = 0;
   resetApdsOcclusionLatch();
   digitalWrite(STATUS_LED_PIN, LOW);
   pushEvent("RETURN_TO_IDLE");
+  syncSessionFromTrial("reset");
 }
 
-void resetTrialToIdle() {
+void resetToReady() {
   g_state = TrialState::Idle;
   g_hover_ms = 0;
   g_state_enter_ms = millis();
   g_dock_complete_consumed = false;
+  g_trial_finalize_once = false;
+  g_final_score_printed = false;
   g_start_action_consumed = false;
   g_end_action_consumed = false;
+  g_trial_running_start_ms = 0;
+  resetTrialMetrics();
   resetApdsOcclusionLatch();
   digitalWrite(STATUS_LED_PIN, LOW);
   pushEvent("RESET");
+  syncSessionFromTrial("reset");
+}
+
+void finalizeTrial(const char *event) {
+  if (g_trial_finalize_once || g_state == TrialState::Complete || g_state == TrialState::Idle) {
+    return;
+  }
+  g_trial_finalize_once = true;
+  g_dock_complete_consumed = true;
+  transitionTo(TrialState::Complete, event);
+  digitalWrite(STATUS_LED_PIN, HIGH);
+  processAllPendingEvents(millis());
 }
 
 void startTrial() {
-  if (g_state != TrialState::Idle && g_state != TrialState::Complete) {
+  if (g_session != SessionState::Ready) {
+    logDiag("start_ignored_session");
+    return;
+  }
+  if (g_state != TrialState::Idle) {
+    logDiag("start_ignored_trial_state");
     return;
   }
   ++g_trial_id;
   g_sample_index = 0;
+  g_trial_finalize_once = false;
+  g_final_score_printed = false;
   resetTrialMetrics();
   resetApdsOcclusionLatch();
   snapshotTiltBaselineAtTrialStart();
   g_roll_idx = 0;
   g_roll_count = 0;
   g_last_live_print_ms = 0;
+  g_trial_running_start_ms = millis();
   strncpy(g_current_live_issue, "Smooth", sizeof(g_current_live_issue) - 1);
   g_metrics.trial_id = g_trial_id;
+  g_start_action_consumed = false;
+  g_end_action_consumed = false;
   transitionTo(TrialState::Approach, "TRIAL_START");
+  logDiag("trial_start");
+  processAllPendingEvents(millis());
+}
+
+void sessionPrepare() {
+  if (g_session == SessionState::Idle) {
+    resetToReady();
+    return;
+  }
+  if (g_session == SessionState::Complete) {
+    returnToReadyFromComplete();
+    processAllPendingEvents(millis());
+  }
+}
+
+void sessionStart() {
+  if (g_session == SessionState::Running) {
+    logDiag("start_ignored_running");
+    return;
+  }
+  if (g_session == SessionState::Complete) {
+    logDiag("start_ignored_complete");
+    return;
+  }
+  if (g_session == SessionState::Error) {
+    logDiag("start_ignored_error");
+    return;
+  }
+  if (g_session == SessionState::Idle) {
+    resetToReady();
+    processAllPendingEvents(millis());
+  }
+  if (g_session == SessionState::Ready) {
+    startTrial();
+  }
+}
+
+void sessionStop() {
+  if (!isTrialRunning()) {
+    logDiag("stop_ignored_not_running");
+    return;
+  }
+  logDiag("trial_stop");
+  finalizeTrial(g_state == TrialState::Dock ? "DOCK_COMPLETE" : "STOP_COMPLETE");
+}
+
+void sessionReset() {
+  logDiag("trial_reset");
+  resetToReady();
+  processAllPendingEvents(millis());
+}
+
+void returnToIdleFromComplete() {
+  returnToReadyFromComplete();
+}
+
+void resetTrialToIdle() {
+  resetToReady();
 }
 
 void handleButtons() {
   updateButtonConsumedLatch(startButton, &g_start_action_consumed);
   updateButtonConsumedLatch(endButton, &g_end_action_consumed);
 
-  if (g_state == TrialState::Idle || g_state == TrialState::Complete) {
-    if (buttonStablePressedFor(startButton, kButtonActionHoldMs) &&
-        !g_start_action_consumed) {
-      g_start_action_consumed = true;
-      startTrial();
-      processAllPendingEvents(millis());
+  if (startButton.pressed_edge && !g_start_action_consumed) {
+    g_start_action_consumed = true;
+    if (g_session == SessionState::Ready || g_session == SessionState::Idle) {
+      logDiag("button_start");
+      sessionStart();
+    } else {
+      logDiag("button_start_ignored");
     }
   }
 
-  if (g_state == TrialState::Dock && !g_dock_complete_consumed) {
-    if (buttonStablePressedFor(endButton, kEndHoldMs) && !g_end_action_consumed) {
-      g_end_action_consumed = true;
-      g_dock_complete_consumed = true;
-      transitionTo(TrialState::Complete, "DOCK_COMPLETE");
-      digitalWrite(STATUS_LED_PIN, HIGH);
-      processAllPendingEvents(millis());
-    }
-  }
-
-  if (g_state == TrialState::Complete) {
-    if (buttonStablePressedFor(endButton, kEndHoldMs) && !g_end_action_consumed) {
-      g_end_action_consumed = true;
-      returnToIdleFromComplete();
-      processAllPendingEvents(millis());
+  if (endButton.pressed_edge && !g_end_action_consumed) {
+    g_end_action_consumed = true;
+    if (g_session == SessionState::Running) {
+      logDiag("button_stop");
+      sessionStop();
+    } else if (g_session == SessionState::Complete) {
+      logDiag("button_reset");
+      sessionReset();
+    } else if (g_session == SessionState::Error) {
+      logDiag("button_reset_error");
+      sessionReset();
+    } else {
+      logDiag("button_end_ignored");
     }
   }
 }
@@ -1852,6 +2061,12 @@ void maybePrintLiveFeedback(unsigned long now, const ApdsFrame &f, bool is_stabl
   Serial.print(computeActiveScoreEstimate());
   Serial.print(F(",issue="));
   Serial.print(g_current_live_issue);
+  if (g_trial_running_start_ms > 0) {
+    Serial.print(F(",elapsed_ms="));
+    Serial.print(now - g_trial_running_start_ms);
+  }
+  Serial.print(F(",session="));
+  Serial.print(sessionName(g_session));
   if (g_state == TrialState::Approach) {
     Serial.print(F(",gyro_rms="));
     Serial.print(roll_gyro, 1);
@@ -2128,9 +2343,11 @@ void maybeUpdateOled(unsigned long now) {
   if (!g_oled_ok) {
     return;
   }
-  if (static_cast<long>(now - g_last_oled_ms) < static_cast<long>(kOledUpdateMs)) {
+  if (!g_oled_force_refresh &&
+      static_cast<long>(now - g_last_oled_ms) < static_cast<long>(kOledUpdateMs)) {
     return;
   }
+  g_oled_force_refresh = false;
   updateOled(g_last_apds_frame, g_last_is_stable);
 }
 
@@ -2210,15 +2427,18 @@ void handleSerialCommand(char c, bool *dock_sim) {
   switch (c) {
     case 's':
     case 'S':
-      if (g_state == TrialState::Idle || g_state == TrialState::Complete) {
-        startTrial();
-        processAllPendingEvents(millis());
-      }
+      logDiag("serial_start");
+      sessionStart();
+      break;
+    case 'e':
+    case 'E':
+      logDiag("serial_stop");
+      sessionStop();
       break;
     case 'r':
     case 'R':
-      resetTrialToIdle();
-      processAllPendingEvents(millis());
+      logDiag("serial_reset");
+      sessionReset();
       break;
     case 'd':
     case 'D':
@@ -2326,96 +2546,57 @@ void updateOled(const ApdsFrame &f, bool is_stable) {
     return;
   }
   const unsigned long now = millis();
-  if (static_cast<long>(now - g_last_oled_ms) < static_cast<long>(kOledUpdateMs)) {
-    return;
-  }
   g_last_oled_ms = now;
 
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  switch (g_state) {
-    case TrialState::Idle:
-      oledTextLarge(0, 0, F("IDLE"));
-      {
-        char buf[24];
-        snprintf(buf, sizeof(buf), "Trial %u", static_cast<unsigned>(g_trial_id + 1));
-        oledTextSmall(0, 20, buf);
+  switch (g_session) {
+    case SessionState::Idle:
+      oledTextLarge(0, 0, F("MYOSA"));
+      oledTextSmall(0, 20, F("System Idle"));
+      oledTextSmall(0, 40, F("Connecting..."));
+      break;
+
+    case SessionState::Ready:
+      oledTextLarge(0, 0, F("MYOSA"));
+      oledTextSmall(0, 20, F("READY"));
+      oledTextSmall(0, 40, F("PRESS START"));
+      break;
+
+    case SessionState::Running: {
+      char buf[20];
+      snprintf(buf, sizeof(buf), "SCORE %d", scoreForSerialOutput());
+      oledTextSmall(0, 0, buf);
+      if (g_trial_running_start_ms > 0) {
+        const float sec = static_cast<float>(now - g_trial_running_start_ms) / 1000.0f;
+        snprintf(buf, sizeof(buf), "TIME %.1f", sec);
+        oledTextSmall(0, 12, buf);
       }
-      if (g_last_completed_trial_score > 0) {
-        char buf[24];
-        snprintf(buf, sizeof(buf), "Prev: %d/100", g_last_completed_trial_score);
-        oledTextSmall(0, 32, buf);
-        if (g_last_feedback[0] != '\0') {
-          oledTextSmall(0, 44, g_last_feedback);
+      oledTextSmall(0, 28, currentLiveFeedback());
+      snprintf(buf, sizeof(buf), "%s", stateName(g_state));
+      oledTextSmall(0, 44, buf);
+      break;
+    }
+
+    case SessionState::Complete:
+      oledTextLarge(0, 0, F("COMPLETE"));
+      {
+        char buf[20];
+        snprintf(buf, sizeof(buf), "SCORE %d", g_metrics.total_score);
+        oledTextSmall(0, 18, buf);
+        if (g_metrics.total_trial_time_ms > 0) {
+          snprintf(buf, sizeof(buf), "TIME %.1fs", g_metrics.total_trial_time_ms / 1000.0f);
+          oledTextSmall(0, 32, buf);
         }
-      }
-      oledTextSmall(0, 54, F("GREEN START"));
-      break;
-
-    case TrialState::Approach:
-      oledTextLarge(0, 0, F("APPROACH"));
-      oledTextSmall(0, 20, currentLiveFeedback());
-      {
-        char buf[20];
-        snprintf(buf, sizeof(buf), "Occ: %.0f%%", f.occlusion_pct);
-        oledTextSmall(0, 32, buf);
-      }
-      oledTextSmall(0, 54, F("Cover target"));
-      break;
-
-    case TrialState::Hover: {
-      oledTextLarge(0, 0, F("HOVER"));
-      oledTextSmall(0, 20, F("Hold steady"));
-      const float prog =
-          static_cast<float>(g_hover_ms) / static_cast<float>(kHoverDwellMs);
-      {
-        char buf[20];
-        snprintf(buf, sizeof(buf), "%.1f/%.1fs", prog * kHoverDwellMs / 1000.0f,
-                 kHoverDwellMs / 1000.0f);
-        oledTextSmall(0, 32, buf);
-      }
-      drawProgressBar(4, 44, 120, 10, prog);
-      oledTextSmall(0, 56, currentLiveFeedback());
-      break;
-    }
-
-    case TrialState::Dock: {
-      oledTextLarge(0, 0, F("DOCK"));
-      oledTextSmall(0, 20, currentLiveFeedback());
-      {
-        char buf[24];
-        snprintf(buf, sizeof(buf), "Hover: %d/30", g_previous_phase_score);
-        oledTextSmall(0, 32, buf);
-      }
-      oledTextSmall(0, 54, F("RED END"));
-      if (g_metrics.hover_complete_ms > 0) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "Dock %lus",
-                 (now - g_metrics.hover_complete_ms) / 1000UL);
-        oledTextSmall(72, 32, buf);
+        oledTextSmall(0, 48, F("RESET FOR NEXT"));
       }
       break;
-    }
 
-    case TrialState::Complete:
-      oledTextLarge(0, 0, F("SCORE"));
-      {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d/100", g_metrics.total_score);
-        oledTextLarge(0, 18, buf);
-      }
-      if (g_metrics.feedback[0] != '\0') {
-        oledTextSmall(0, 36, g_metrics.feedback);
-      }
-      if (g_metrics.got_dock_complete) {
-        char buf[28];
-        snprintf(buf, sizeof(buf), "A:%lus H:%lus D:%lus",
-                 g_metrics.approach_time_ms / 1000UL, g_metrics.hover_time_ms / 1000UL,
-                 g_metrics.dock_time_ms / 1000UL);
-        oledTextSmall(0, 48, buf);
-      }
-      oledTextSmall(0, 54, F("RED RETURN"));
+    case SessionState::Error:
+      oledTextLarge(0, 0, F("ERROR"));
+      oledTextSmall(0, 20, F("Check sensors"));
+      oledTextSmall(0, 40, F("Press RESET"));
       break;
   }
 
@@ -2534,9 +2715,12 @@ void setup() {
     clearEventQueue();
   }
 
-  Serial.println(F("Buttons: GREEN START | RED END / RETURN"));
+  Serial.println(F("Buttons: START (D4) | STOP/RESET (D16)"));
+  Serial.println(F("  START: begins trial from READY only (one press)"));
+  Serial.println(F("  END while RUNNING: stop/finalize | END while COMPLETE: reset to READY"));
+  Serial.println(F("  Mid-trial cancel: dashboard RESET or serial r (not physical END)"));
   Serial.println(
-      F("Serial: s start | d dock | r reset | z baseline | g gain | p score | q thresholds | x csv | b"));
+      F("Serial: s start | e stop | r reset | d dock | z baseline | g gain | p score | q thresholds | x csv | b"));
   Serial.println(
       F("APDS: o=open v=covered x10 each, t=tune, l=clear | SCORE: c=cal ref trial C=clear cal"));
   Serial.println(F("COMPLETE: press RED RETURN -> IDLE"));
@@ -2546,6 +2730,14 @@ void setup() {
 
   g_next_sample_ms = millis();
   pollApdsFrame(millis());
+
+  if (!g_imu_ok || !g_apds_ok) {
+    setSession(SessionState::Error, "hardware");
+  } else {
+    resetToReady();
+    processAllPendingEvents(millis());
+  }
+  printSessionLine("boot");
   updateOled(g_last_apds_frame, false);
 }
 
@@ -2606,9 +2798,7 @@ void loop() {
   maybePrintLiveFeedback(now, frame, is_stable, gyro_mag, jerk_proxy);
 
   if (tryDockCompleteSerial(serial_d)) {
-    transitionTo(TrialState::Complete, "DOCK_COMPLETE");
-    digitalWrite(STATUS_LED_PIN, HIGH);
-    processAllPendingEvents(now);
+    sessionStop();
   }
 
   if (g_stream_raw_csv) {
